@@ -1,0 +1,189 @@
+; MACROS
+
+b = $93
+temp_b = $97
+
+
+        ;
+        ; 16 bit macros
+        ;
+
+        ; add byte to a pointer
+        mac addptr
+        lda {1}
+        clc
+        adc {2}
+        sta {1}
+        lda {1}+1
+        adc #0
+        sta {1}+1
+        endm
+
+        ; add 16bit costant to a pointer
+        mac addwptr
+        lda {1}
+        clc
+        adc {2}%256
+        sta {1}
+        lda {1}+1
+        adc {2}/256
+        sta {1}+1
+        endm
+
+        ; subtract byte from pointer
+        mac subptr
+        lda {1}
+        sec
+        sbc {2}
+        sta {1}
+        lda {1}+1
+        sbc #0
+        sta {1}+1
+        endm
+
+        ; load pointer from 16bit costant
+        mac ldptr
+        lda [{2}]%256
+        sta {1}
+        lda [{2}]/256
+        sta {1}+1
+        endm
+
+        ; copy pointer from other pointer
+        mac copyptr
+        lda {2}
+        sta {1}
+        lda {2}+1
+        sta {1}+1
+        endm
+
+        ; compare pointer with 16 bit costant (equal only compare)
+        mac cmpptr
+        lda {1}+1
+        cmp {2}/256
+        bne .lab1
+        lda {1}
+        cmp {2}%256
+.lab1
+        endm
+
+        ; shift left pointer
+        mac shlptr
+        asl {1}
+        rol {1}+1
+        endm
+
+        ; shift right pointer
+        mac shrptr
+        lsr {1}
+        ror {1}+1
+        endm
+
+        ; load ay from 16bit costant
+        mac lday
+        lda [{1}]%256
+        ldy [{1}]/256
+        endm
+
+        ; macro for b register
+        ; needs b and temp_b in zero page
+
+        mac tba
+        lda b
+        endm
+
+        mac tbx
+        ldx b
+        endm
+
+        mac tby
+        ldy b
+        endm
+
+        mac tab
+        sta b
+        endm
+
+        mac txb
+        stx b
+        endm
+
+        mac tyb
+        sty b
+        endm
+
+        mac inb
+        inc b
+        endm
+
+        mac deb
+        dec b
+        endm
+
+        mac addb
+        pha
+        lda b
+        clc
+        adc {1}
+        sta b
+        pla
+        endm
+
+        mac subb
+        pha
+        lda b
+        sec
+        sbc {1}
+        sta b
+        pla
+        endm
+
+        mac phb
+        sta temp_b
+        lda b
+        pha
+        lda temp_b
+        endm
+
+        mac plb
+        sta temp_b
+        pla
+        sta b
+        lda temp_b
+        endm
+
+        mac cpb
+        sta temp_b
+        lda b
+        cmp {1}
+        lda temp_b
+        endm
+
+        mac ldb
+        sta temp_b
+        lda {0}
+        sta b
+        lda temp_b
+        endm
+
+        mac stb
+        sta temp_b
+        lda b
+        sta {0}
+        lda temp_b
+        endm
+
+        mac poke
+        lda {2}
+        sta {1}
+        endm
+
+        mac shl
+        asl {0}
+        endm
+
+        mac shr
+        lsr {0}
+        endm
+
+

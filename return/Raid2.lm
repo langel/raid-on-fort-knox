@@ -1,0 +1,1802 @@
+;
+;    *** RETURN TO FORT KNOX ***
+;
+; Based on Commodore's "Raid On Fort Knox"
+;
+; Original Game (C) 1982 Commodore ltd
+;
+; Remixed by Nippur72 in 2007
+
+        processor 6502
+        include "macros.lm"
+
+; ********** ROM CALLS **************
+
+HARDWARE_IRQ   = $EABF
+CHROUT         = $FFD2
+GETIN          = $FFE4
+CLRSCN         = $e55f     ; clear screen
+PRNSTR         = $cb1e     ; print string in A/Y, 0 terminated
+GOHOME         = $e581     ; go home
+PRNINT         = $ddcd     ; print integer in A/X
+
+; ********** Video memory relocations ************
+
+screen_page   = $10
+screen_start  = (screen_page*256)
+color_page    = $94
+color_start   = (color_page*256)
+color_offset  = (color_page-screen_page)
+ram_start     = ($1300)
+def_char_code = $CD
+ncols         = 22
+
+; **** costants ****
+
+bar_offset = $1CE+22          ; progress bar position
+max_guards = $0f              ; numero massimo di guardie
+freeze_max = $A0              ; contatore massimo per freeze 
+
+; **** Program locations ******
+
+freeze_ptr  = $fd             ; puntatore al raggio che spara
+freeze_char = $96             ; carattere del raggio congelante
+curr_guard_color = $07        ; colore corrente della guardia per freeze
+n_guards   = $fb              ; numero di guardie
+man_color  = $fc              ; colore corrente omino
+cursor_ptr = 209              ; puntatore al cursore per PRN
+
+; **** Program Variables *****
+
+init_vals     = ram_start + $000         ; 4 bytes di variabili inizializzate in blocco
+current_guard = ram_start + $000         ; guardia corrente
+gold_taken    = ram_start + $001         ; indicatore se ha già preso il lingotto (per non riprenderlo)
+player_step   = ram_start + $002         ; offset (0..8) del giocatore
+move_code     = ram_start + $003         ; codice spostamento corrente del giocatore (0..3)
+
+lives         = ram_start + $004         ; numero vite
+maze_nr       = ram_start + $005         ; maze number
+game_level    = ram_start + $033         ; 0=easy, 1=normal, 2=hard, 3=hell!
+
+gold_slot     = ram_start + $006         ; slot 0,1,2 dove è stato preso l'ultimo oro
+gold_slot_0   = ram_start + $007         ; numero lingotti nello slot 0
+gold_slot_1   = ram_start + $008         ; numero lingotti nello slot 1
+gold_slot_2   = ram_start + $009         ; numero lingotti nello slot 2
+
+sound_a       = ram_start + $00A         ; variabile per effetto sonoro
+sound_b       = ram_start + $00B         ; variabile per effetto sonoro
+bonus_lives   = ram_start + $00C         ; flag se bonus life gia' preso
+
+guard_buf     = ram_start + $60
+guard_lo      = guard_buf + $10*0       ; puntatori hi byte guardia
+guard_hi      = guard_buf + $10*1       ; puntatore low byte guardia
+guard_dirs    = guard_buf + $10*2       ; direzione (0..3) delle guardie
+guard_steps   = guard_buf + $10*3       ; step delle guardie (0..8)
+guard_freeze  = guard_buf + $10*4       ; freeze counter
+
+bar_counter   = ram_start + $02D         ; contatore progress bar (0=disattivo)
+
+irq_flags     = ram_start + $02F         ; 4 caratteri per irq flags
+irq_flag0     = ram_start + $02F         ; flag irq per routine "GamePartOne"
+irq_flag1     = ram_start + $030         ; flag irq per routine "GamePartTwo"
+irq_flag2     = ram_start + $031         ; flag irq per routine "DoSounds"
+irq_flag3     = ram_start + $032         ; flag irq per routine "ManageProgressBar"
+
+guard_speed   = ram_start + $035         ; valore da settare per il contatore di velocita guardie (va in irq_flag1)
+new_bar_speed = ram_start + $036         ; valore da settare per lo scorrimento della barra
+curr_score    = ram_start + $038         ; punteggio corrente (4 caratteri)
+print_score   = ram_start + $03C         ; other score
+last_score    = ram_start + $040         ; ultimo punteggio (4 caratteri)
+high_score    = ram_start + $048         ; hiscore (4 caratteri)
+
+; *****************************
+
+title_1_pos  = screen_start + 1 * ncols + 1
+title_2_pos  = screen_start + 4 * ncols + 1
+title_2a_pos = screen_start + 5 * ncols + 4
+title_2b_pos = screen_start + 5 * ncols + 5
+title_2c_pos = screen_start + 5 * ncols + 13
+title_3_pos  = screen_start + 9 * ncols + 1
+title_4_pos  = screen_start +11 * ncols + 1
+title_5_pos  = screen_start +16 * ncols + 5
+title_6_pos  = screen_start +18 * ncols + 5
+title_7_pos  = screen_start +20 * ncols + 5
+going_to_maze_pos = screen_start + 11 * ncols + 6
+
+
+        org $1201
+        byte $0b,$12,$d7,$07,158,"7","1","6","8",0,0,0 ; rem=143, sys=158
+        include "chars.lm"
+        org $1C00
+
+Start_8K:                                ; @@@
+
+        cli
+        lda #(irq_handler%256)              ; installa_irq
+        sta $0314
+        lda #(irq_handler/256)
+        sta $0315
+        sei
+
+        ;
+        ; esegue inizializzazioni valori iniziali
+        ;
+        lda #$00
+        sta bar_counter
+        sta gold_taken
+        lda #$01
+        sta game_level
+
+        ; azzera score
+        ldx #$04
+        lda #$30
+        do
+           sta curr_score,x
+           sta high_score,x
+           sta last_score,x
+           dex
+        loop while not negative
+
+        poke 36869, #def_char_code     ; caratteri definibili a 5120
+
+        poke $0291, #$80               ; blocca CBM + SHIFT
+
+        jmp IntroScreen
+
+;
+; IRQ handler: decrementa i contatori delle routines principali
+; portandoli fino a zero, temporizzando le stesse
+;
+
+irq_handler:
+        ldx #$00
+        do
+           lda irq_flags,x
+           if not zero then
+              dec irq_flags,x
+           end if
+           inx
+        loop while x<>#$04
+        jmp HARDWARE_IRQ
+
+
+StartNewLifeLoop:
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        dec lives
+        lda lives
+        bmi IntroScreen
+        jmp DrawMaze
+
+;
+; ***** Main candidate *****
+;
+
+IntroScreen:
+        lda #$02
+        sta lives
+        lda #$01
+        sta bonus_lives
+
+        lda #(IntroScreenData%256)   ; sposta memoria da $B75C a video
+        sta $00                      ; e resetta color ram
+        lda #(IntroScreenData/256)   ; 2 pagine (512 bytes)
+        sta $01
+        lda #$00
+        sta $02
+        sta $04
+        lda #screen_page
+        sta $03
+        lda #color_page
+        sta $05
+        ldx #$02
+        do
+           ldy #$00
+           do
+              lda ($00),y
+              sta ($02),y
+              lda #$00
+              sta ($04),y
+              iny
+           loop while not zero
+           inc $01
+           inc $03
+           inc $05
+           dex
+        loop while not zero
+
+        poke 36879, #$8F              ; colore schermo per intro screen
+
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        jsr Wait
+
+MainScreen:
+        poke 36879, #$1B             ; colore schermo principale
+
+DoLastScore:
+        ldx #$04                     ; copia score (4 caratteri) in last score
+        do
+           lda curr_score,x          ; e imposta current score a "0"
+           sta last_score,x
+           lda #$30
+           sta curr_score,x
+           dex
+        loop while not negative
+
+DoHiscore:
+        ldx #$00                  ; confronta last_score con hiscore
+LA112:  lda last_score,x          ; e se necessario lo copia (4 caratteri)
+        cmp high_score,x
+        beq LA11E
+        bpl LA123
+        bmi MainScreenDraw
+LA11E:  inx
+        cpx #$04
+        bne LA112
+LA123:  lda last_score,x
+        sta high_score,x
+        inx
+        cpx #$05
+        bne LA123
+
+MainScreenDraw:
+       jsr CLRSCN
+
+MainScreenDraw1:
+       ldptr cursor_ptr, #title_1_pos
+       lda #(title_1%256)
+       ldy #(title_1/256)
+       jsr my_print
+
+
+       ldptr cursor_ptr, #title_2_pos
+
+       lda #(title_2%256)
+       ldy #(title_2/256)
+       jsr my_print
+
+
+       ldptr cursor_ptr, #title_2a_pos
+
+       lda #(title_2a%256)
+       ldy #(title_2a/256)
+       jsr my_print
+
+
+       ldptr cursor_ptr, #title_3_pos
+
+       lda #(title_3%256)
+       ldy #(title_3/256)
+       jsr my_print
+
+
+       ldptr cursor_ptr, #title_4_pos
+
+       lda #(title_4%256)
+       ldy #(title_4/256)
+       jsr my_print
+
+
+       ldptr cursor_ptr, #title_5_pos
+
+       lda #(title_5%256)
+       ldy #(title_5/256)
+       jsr my_print
+
+
+       ldptr cursor_ptr, #title_5_pos
+
+       lda #(title_5%256)
+       ldy #(title_5/256)
+       jsr my_print
+
+       ldptr cursor_ptr, #title_6_pos
+
+       lda #(title_6%256)
+       ldy #(title_6/256)
+       jsr PRNSTR
+
+       ; stampa scritta easy-normal-hard-hell
+       lda game_level
+       asl
+       asl
+       asl
+       clc
+       adc #(title_level_1%256)
+       tax
+       lda #(title_level_1/256)
+       adc #0
+       tay
+       txa
+       jsr PRNSTR
+       jsr GOHOME
+
+       ldy #$04
+       do
+           lda last_score,y
+           sta title_2b_pos,y
+           lda high_score,y
+           sta title_2c_pos,y
+           dey
+       loop while not negative
+
+IntroKeyLoop:
+        poke 198, #0
+        do
+           lda $911F
+           and #32
+           if zero then goto GameStart
+           jsr GETIN
+        loop while a=#$00
+
+        ; tasto F1
+        if a==#$85 then goto GameStart
+
+        if a==#$86 then
+           inc game_level
+           lda game_level
+           and #$03
+           sta game_level
+           jmp MainScreenDraw1
+        end if
+
+        jmp MainScreenDraw1
+
+GameStart:
+        ; wait release of fire button
+        do
+           lda $911F
+           and #32
+        loop while zero
+
+        ldx game_level          ; numero di guardie in base al livello
+        lda level_table,x
+        sta n_guards
+
+        lda #$0
+        sta maze_nr
+
+        lda #$0E          ; era #$09
+        sec
+        sbc maze_nr
+        sta new_bar_speed
+
+        jsr SetGold
+
+DrawMaze:
+        jsr screen_load
+
+        ; scrive scritta "maze"
+        ldptr cursor_ptr, #[screen_start+$05]
+        lda #([going_to_maze+3]%256)
+        ldy #([going_to_maze+3]/256)
+        jsr PRNSTR
+
+        ldx maze_nr
+
+        inx
+
+        lda #0
+        jsr PRNINT
+        jsr GOHOME
+
+        jsr DrawGoldSlots         ; disegna qualcosa (non ancora identificato)
+
+        lda #$29                  ; pone $1e29 nel puntatore $00 (omino in alto a dx)
+        sta $00
+        lda #screen_page
+        sta $01
+
+        lda #$06
+        sta man_color             ; colore omino
+
+        lda #$03
+        sta guard_speed           ; imposta velocita guardie
+
+        ldx #$03                  ; copia 4 bytes da area (init probabilmente)
+        do
+           lda ProgramData,x
+           sta init_vals,x
+           dex
+        loop while not negative
+
+        ldx #$0f                  ; initializes all guards
+        do
+           lda #$52
+           sta guard_lo,x
+           lda #(screen_page+1)
+           sta guard_hi,x
+           txa
+           and #$03
+           sta guard_dirs,x
+
+           lda #0
+           sta guard_steps,x
+           sta guard_freeze,x
+
+           dex
+        loop while not negative
+
+        jsr DrawLives
+
+RestoreIRQCounters:
+        ldx #$00                      ; azzera gli irq_flags iniziali  (###)
+        do
+           lda #$00
+           sta irq_flags,x
+           inx
+        loop while x<>#$04
+        jmp GameLoop
+
+DrawLives:
+        ldx lives                     ; disegna omini (vite) in alto
+        do
+          lda #$80
+          sta screen_start,x
+          lda #$00
+          sta color_start,x
+          dex
+        loop while not negative
+        rts
+
+irq_flag0_init_val:    .byte   $01
+irq_flag1_init_val:    .byte   $03
+irq_flag2_init_val:    .byte   $01
+irq_flag3_init_val:    .byte   $08
+
+GameLoop:
+        jsr GamePartOne
+        jsr GamePartTwo
+        jsr PrintScore
+        jsr DoSounds
+        jsr ManageProgressBar
+        jmp GameLoop
+
+;
+; **** esegue un ciclo di pausa
+;
+
+Wait:
+        ldx #$00
+        do
+           ldy #$00
+           do
+              iny
+           loop while not zero
+           inx
+        loop while not zero
+        rts
+
+;
+; Probabile routine keyboard / joystick
+;
+
+GamePartOne:
+        lda irq_flag0                ; controlla il flag se deve attivare la routine
+        if not zero then
+           rts
+        end if
+
+        lda irq_flag0_init_val       ; ripristina il valore del contatore
+        sta irq_flag0
+
+        lda player_step
+        if not zero then
+           jmp DrawMan
+        end if
+
+ReadJoystick:
+        ldy #$00                 ; legge joystick
+        ldx $911F
+        txa
+        and #$04                 ; direzione 1, y=0
+        beq LA2F7
+        txa
+        and #$08                 ; direzione 2, y=3
+        beq LA2F4
+        txa
+        and #$10                 ; direzione 3, y=1
+        beq LA2F6
+
+        txa
+        and #32                  ; firebutton
+        if zero then goto FireButton
+
+        lda #$7F
+        sta $9122
+        lda $9120
+        and #$80                 ; direzione 4, y=2
+        beq LA2F5
+
+        lda #$FF
+        sta $9122
+        bne ReadKeyboard
+
+MovementCodeJoystick:
+LA2F4:  iny
+LA2F5:  iny
+LA2F6:  iny
+LA2F7:  lda #$FF
+        sta $9122                ; ripristina tastiera
+        tya
+        tax
+        jmp MovePlayerNewDir
+
+
+ReadKeyboard:
+        lda $28d
+        cmp #$2
+        if zero then
+FireButton:
+           jsr FreezeRay
+        end if
+
+        lda $CB                       ; legge tasto premuto (203=same as 197)
+        if a=#64 then DoMovePlayer    ; nessun tasto premuto, sposta con vecchia direzione
+
+FindKey:
+        ldx #$03
+        do
+           cmp KeyCodeTable,x
+           if zero then goto MovePlayerNewDir
+           dex
+        loop while not negative
+        jmp DoMovePlayer
+
+;
+; riceve in x il codice movimento/tasto (0,1,2,3)
+; sposta il giocatore in base alla nuova direzione
+; accettandola solo se è casella libera
+;
+
+MovePlayerNewDir:
+        lda MoveTable,x             ; sposta il puntatore del giocatore
+        tay                         ; y contiene il numero da sommare, x il codice direzione
+        if negative then
+           dec $01                  ; se negativo, si sposta di pagina
+           lda ($00),y
+           inc $01
+        else
+           lda ($00),y
+        end if
+
+        if a=#$20 then              ; se la casella è libera accetta il movimento
+           stx move_code            ; memorizzando il codice direzione (x)
+        end if
+
+DoMovePlayer:                       ; sposta il giocatore su una direzione gia' assestata
+        ldx move_code
+        lda MoveTable,x             ; esegue la somma del codice nel puntatore ($00)
+        if negative then
+           dec $01
+        end if
+        clc
+        adc $00
+        sta $00
+        if carry then
+           inc $01
+        end if
+
+        ldy #$00                    ; controlla collisione del giocatore
+        lda ($00),y
+        if a=#$20 then goto NoCollision
+
+PlayerCollision:
+        ldx #$03                    ; find collision con simboli: 0=maze, 1=oro1, 2=oro2, 3=tana
+        do
+           cmp CollisionTable,x
+           if equal then goto FoundGold
+           dex
+        loop while not negative
+
+        ; **** controllo che non collida con una guardia congelata
+        clc
+        lda $01
+        adc #color_offset
+        sta $01
+        lda ($00),y
+        and #$07
+        cmp #$03
+        if equal then
+           ldx #$0
+        else
+           ldx #$1
+        end if
+        sec
+        lda $01
+        sbc #color_offset
+        sta $01
+        if x=#$0 then
+           jmp FoundGold
+        endif
+        ; **** fine controllo collisione con guardia congelata
+
+        jsr  DrawMan              ; killed: disega omino e
+        poke bar_counter,#$00     ; ripristina contatore
+        jmp  CapturedMan2         ;
+
+FoundGold:
+        txa                              ; x contiene il codice oro (oro o tana)
+        asl
+        tax                              ; fa uno sporchissimo jump condizionale
+        lda FoundGoldJumpTable,x         ;
+        pha                              ; on x goto $a3d5, $a3e9, $a3e9, $a42e
+        lda [FoundGoldJumpTable+1],x     ; on x goto FoundMaze, FoundLingot, FoundLingot, FoundNest
+        tax
+        dex
+        txa
+        pha
+        rts
+
+NoCollision:                             ; non c'è nessuna collisione,
+        lda #$08                         ; imposta omino in posizione allineata
+        sta player_step
+
+DrawMan:
+        ldx move_code                    ; calcola primo carattere omino
+        lda player_step
+DrawMan1:
+        asl
+        clc
+        adc Mul16Table,x
+        tax                              ; x = move_code*8*2 + player_step*2;
+        lda CharManMoveTable,x           ; a = CharManMoveTable(x)
+
+        ldy #$00                         ; scrive su video primo carattere omino
+        sta ($00),y
+
+        lda $01                          ; scrive colore omino con puntatore ($02)
+        clc                              ;
+        adc #color_offset                ;
+        sta $03                          ; e pone in 03 la pagina colore
+        lda $00                          ;
+        sta $02                          ;
+        lda man_color                    ; $04 = colore omino
+        sta ($02),y                      ;
+
+        inx                              ; calcola posizione secondo carattere omino
+        lda CharManMoveTable,x           ; in base alla direzione e la mette nel puntatore ($02)
+        pha                              ; che contiene il puntatore alla memoria colore
+        ldx move_code                    ; mette inoltre nello stack il carattere dell'omino calcolato
+        lda ScreenMoveTable,x
+        if negative then
+           dec $03
+        end if
+        clc
+        adc $02
+        sta $02
+        if carry then
+           inc $03
+        end if
+
+        lda man_color                    ; scrive colore
+        sta ($02),y
+
+        lda $03                          ; ritorna nella pagina video
+        sec
+        sbc #color_offset
+        sta $03
+
+        pla                              ; ripiglia carattere omino dallo stack
+        sta ($02),y                      ; e lo scrive
+
+        lda player_step                  ; aggiorna lo step ed esegue il suono
+        and #$03                         ;
+        if zero then                     ;
+           lda #$0F                      ;
+           sta 36878                     ;
+           lda #$80                      ;
+           sta 36874                     ;  (###)
+        else                             ;
+           lda #$00                      ;
+           sta 36874                     ;
+        end if                           ;
+        dec player_step                  ;
+
+        rts
+
+FreezeRay:
+        lda $00
+        sta freeze_ptr
+        lda $01
+        sta freeze_ptr+1
+
+FreezeDrawLoop:
+        ldx move_code
+        lda FreezeTable,x
+        sta freeze_char
+        lda MoveTable,x
+        if negative then
+           dec freeze_ptr+1
+        end if
+        clc
+        adc freeze_ptr
+        sta freeze_ptr
+        if carry then
+           inc freeze_ptr+1
+        end if
+
+        ldy #$00
+        lda (freeze_ptr),y
+        if a=#$20 then
+           lda freeze_char
+           sta (freeze_ptr),y
+
+           ; freeze color
+           lda freeze_ptr+1
+           clc
+           adc #color_offset
+           sta freeze_ptr+1
+           lda #$03
+           sta (freeze_ptr),y
+           lda freeze_ptr+1
+           sec
+           sbc #color_offset
+           sta freeze_ptr+1
+
+           jmp FreezeDrawLoop
+        end if
+
+        ; controlla collisione con guardia
+        ldx #00
+        do
+           ; collisione con testa guardia
+           lda guard_lo,x
+           cmp freeze_ptr
+           if equal then
+              lda guard_hi,x
+              cmp freeze_ptr+1
+              if equal then
+                 lda #freeze_max
+                 sta guard_freeze,x
+              end if
+           end if
+
+           ; collisione con coda guardia
+           lda guard_hi,x
+           sta $05
+           lda guard_lo,x
+           sta $04
+           lda guard_dirs,x
+           tay
+           lda ScreenMoveTable,y
+           if negative then
+              dec $05
+           end if
+           clc
+           adc $04
+           sta $04
+           if carry then
+              inc $05
+           end if
+           cmp freeze_ptr
+           if equal then
+              lda $05
+              cmp freeze_ptr+1
+              if equal then
+                 lda #freeze_max
+                 sta guard_freeze,x
+              end if
+           end if
+
+           inx
+        loop while x<>n_guards
+
+        ; effetto sonoro/pausa
+        lda #15
+        sta 36878
+        lda #0
+        sta 36874
+        sta 36875
+        sta 36876
+
+        lda #249
+        ldx #$ff
+        do
+           sta 36877
+           ldy #$ff
+           do
+              dey
+           loop while not zero
+           dex
+        loop while not zero
+        lda #0
+        sta 36877
+
+        lda $00
+        sta freeze_ptr
+        lda $01
+        sta freeze_ptr+1
+
+FreezeEraseLoop:
+        ldx move_code
+        lda MoveTable,x
+        if negative then
+           dec freeze_ptr+1
+        end if
+        clc
+        adc freeze_ptr
+        sta freeze_ptr
+        if carry then
+           inc freeze_ptr+1
+        end if
+
+        ldy #$00
+        lda (freeze_ptr),y
+        if a=freeze_char then
+           lda #$20
+           sta (freeze_ptr),y
+           jmp FreezeEraseLoop
+        end if
+
+        rts
+
+
+FoundMaze:                               ; proviene da un jump condizionale $A3D5
+        ldx move_code
+        lda ScreenMoveTable,x            ; se ha trovato un maze annulla lo
+        if negative then                 ; spostamento, riposizionando il puntatore
+           dec $01                       ; dove era prima
+        end if
+        clc
+        adc $00
+        sta $00
+        if carry then
+           inc $01
+        end if
+        rts
+
+FoundLingot:                                ; proviene da un jump condizionale $A3E9
+        lda gold_taken
+        if not zero then                    ; se ha gia preso lingotto (###)
+           jmp FoundMaze
+        end if
+        ldx #$00                            ; verifica sul puntatore omino ($00)
+        lda $01
+        cmp #(screen_page+1)
+        beq LA401
+        lda $00
+        cmp #$DC
+        bpl LA402
+        bmi LA403
+LA401:  inx
+LA402:  inx                                 ; x=2 se in pagina $1F; x=1 se riga > #$DC, x=0 se riga < #$DC
+LA403:  stx gold_slot                       ; probabile indicatore della riga del lingotto
+        inx
+        stx gold_taken                      ; setta indicatore lingotto preso ad un valore <> 0
+
+        lda #$05                            ; cambia colore ad omino
+        sta man_color
+
+        lda #$02                            ; riduce velocita guardie (da 3 a 2)
+        sta guard_speed
+
+        poke bar_counter,#$9F               ; inizia a far decrementare la progress bar
+
+        lda ($00),y
+        if a=#$57 then                      ; se ha preso un mattone singolo non disegna niente al suo posto
+           jsr DoStoleNoise
+           jmp NoCollision
+        end if
+        lda #$57                            ; altrimenti è sicuramente un mattone doppio, disegna singolo
+        sta ($00),y
+        jsr DoStoleNoise
+        jmp FoundMaze
+
+FoundNest:                             ; proviene da un jump condizionale $A42E
+        lda gold_taken
+        if zero then goto FoundMaze    ; se non ha lingotto, non fa niente
+
+        poke man_color, #$06           ; ripristina colore omino
+        poke guard_speed,#$03          ; ripristina velocita guardie
+        poke gold_taken, #$00          ; ripristina indicatore lingotto preso
+
+        ldy bar_counter
+        if not zero then               ; se c'è la barra la somma al punteggio
+           sei                         ; incrementandolo ad uno ad uno
+           do
+              jsr IncrementScore
+              dec bar_counter
+              jsr DrawProgressBar
+              ldy bar_counter
+           loop while not zero
+           poke bar_counter,#$00       ; azzera progressbar and restores
+           jsr  DrawFullBar
+           cli
+        end if
+
+CountGoldLeft:
+        ldx gold_slot               ; decrementa l'oro nello slot
+        dec gold_slot_0,x
+
+        lda gold_slot_0             ; conta quanto oro è rimasto (###)
+        clc
+        adc gold_slot_1
+        clc
+        adc gold_slot_2
+        if not zero then goto DepositGold
+
+NewLevel:
+        jsr SetGold
+        ldy n_guards
+
+        ; assegna bonus maze
+        do
+           ldx #$02
+           jsr IncrementScore2
+           dey
+        loop while not zero
+
+        /*
+        ; scrive scritta "bonus maze"
+        ldx #$19
+        do
+           lda BonusMazeStringTable,x
+           jsr CHROUT
+           dex
+        loop while not negative
+        */
+
+        ; incrementa numero di guardie (fino a 6)
+        lda n_guards
+        if a<>#max_guards then
+           inc n_guards
+        end if
+
+        ; incrementa maze_nr
+        inc maze_nr
+        lda maze_nr
+        and #$07
+        sta maze_nr
+
+        ; scrive scritta "going maze"
+        jsr CLRSCN
+        ldptr cursor_ptr, #going_to_maze_pos
+        lda #(going_to_maze%256)
+        ldy #(going_to_maze/256)
+        jsr PRNSTR
+
+        ldx maze_nr
+
+        inx
+
+        lda #0
+        jsr PRNINT
+        jsr GOHOME
+
+        jsr SetGold        ; imposta oro per i livello
+
+        lda #$00           ; ammutolisce
+        sta 36878
+        sta 36876
+
+        jsr Wait           ; attende e riparte
+        jsr Wait
+        jsr Wait
+        jsr Wait
+        jmp DrawMaze
+
+DepositGold:
+        lda #$0F           ; ammutolisce
+        sta 36878
+        sta 36874
+        sta 36875
+        sta 36876
+
+        ; fa effetto sonoro di deposito gold
+        ldx #$00
+        do
+           stx 36877
+           jsr SmallWait
+           dex
+        loop while negative
+
+        poke 36877, #$00   ; ammutolisce
+        
+        jmp FoundMaze
+
+;
+; Imposta le vite a 3
+;
+
+SetGold:
+        ldx #$02
+        lda #$02
+        do                        ; imposta numero lingotti negli slot a 2
+           sta gold_slot_0,x
+           dex
+        loop until negative
+        rts
+
+;
+; Esegue un piccolo ciclo di ritardo
+;
+
+SmallWait:
+        ldy #$00
+        do
+          iny
+        loop while not zero
+        rts
+
+;
+; Fa il rumore di quando si prende un gold
+;
+
+DoStoleNoise:
+        lda #$0F
+        sta 36878
+        sta 36874
+        sta 36875
+        sta 36876
+        ldx #$80
+        do
+           stx 36877
+           jsr SmallWait
+           inx
+        loop while negative
+        stx 36877
+        rts
+
+;
+; Incrementa il punteggio di 1 ed assegna una vita se
+; scatta la prima cifra ed il bonus non e' gia' stato dato
+;
+
+IncrementScore:
+        ldx #$04
+IncrementScore2:
+        inc curr_score,x
+        lda curr_score,x
+        cmp #$3A            ; > "9" ?
+        bne LA53B
+        lda #$30            ; "0"
+        sta curr_score,x
+        dex
+        bmi LA53B
+        cpx #$01            ; e' arrivato ad incrementare la prima cifra?
+        bne IncrementScore2 ; no continua ad incrementare
+        lda bonus_lives     ; gia preso il bonus ?
+        bne IncrementScore2 ; si, continua
+        inc lives           ; no, incrementa le vite
+        stx $02
+        jsr DrawLives
+        ldx $02
+        sta bonus_lives     ; bonus gia dato
+        beq IncrementScore2
+LA53B:  rts
+
+
+;
+; Stampa il punteggio a video (4 caratteri)
+;
+
+PrintScore:
+        ldx #$04
+        do
+           lda curr_score,x
+           sta [screen_start+$0D],x
+           lda #$00
+           sta [color_start+$0D],x
+           dex
+        loop while not negative
+        rts
+
+;
+; Movimento guardie
+;
+
+GamePartTwo:
+        lda irq_flag1            ; controllo abilitazione movimento (velocita')
+        if not zero then
+           rts
+        end if
+
+        lda guard_speed          ; reimposta contatore velocita routine
+        sta irq_flag1
+
+        ;
+        ; ciclo principale delle guardie, conta da 1 a n_guards
+        ;
+
+        ldx #$00
+GuardLoop:
+        stx current_guard            ; imposta guardia corrente
+
+        lda guard_lo,x               ; carica puntatore video guardia ($02)
+        sta $02
+        lda guard_hi,x
+        sta $03
+        lda guard_steps,x
+        if not zero then goto MoveGuard    ; sposta di pixel offset soltanto
+
+        ; esegue spostamento guardia
+        lda guard_dirs,x
+        tax
+        lda MoveTable,x
+        if negative then
+           dec $03
+        end if
+        clc
+        adc $02
+        sta $02
+        if carry then
+           inc $03
+        end if
+
+        ; controlla collisione
+        ldy #$00
+        lda ($02),y
+        if a=#$20 then goto MoveGuard ; collide con spazio, prosegue
+        if a=#$5C then                ; collide con maze, cambia direzione
+          jsr MoveOneGuard
+          jmp GuardTurnMaze
+        end if
+
+        ; trova se collide con omino
+        ldx #$3F
+        do
+           cmp CharManMoveTable2,x
+           if zero then goto CapturedMan1
+           dex
+           cmp CharManMoveTable2,x
+           if zero then goto CapturedMan2
+           dex
+        loop while not negative
+
+        ; ha trovato qualcosaltro, cambia direzione
+        jmp GuardChangeDir
+
+;
+; Man captured by collision on the first character of the man
+;
+
+CapturedMan1:
+        lda $03              ; ridisegna omino con step 1, ripristinando i puntatori
+        pha
+        lda $02
+        pha
+        lda #$01
+        ldx move_code
+        jsr DrawMan1
+        pla
+        sta $02
+        pla
+        sta $03
+
+        lda #$01             ; imposta step a 1
+        ldx current_guard
+        sta guard_steps,x
+        jsr DrawGuard
+
+        lda $03              ; va in pagina colore
+        clc
+        adc #color_offset
+        sta $03
+        lda #$00             ; ripristina colore nero
+        sta ($02),y
+        lda $03
+        sec
+        sbc #color_offset    ; ritorna in pagina video
+        sta $03
+        jsr DrawGuard2
+        jmp Killed
+
+;
+; Man captured by collision on the second character of the man
+;
+
+CapturedMan2:
+        lda #$01         ; disegna uomo con step 1
+        ldx move_code    ; va alla sequenza killed
+        jsr DrawMan1
+        jmp Killed
+
+MoveGuard:
+        ldx current_guard
+        lda guard_steps,x
+        if zero then
+           lda #$08
+           sta guard_steps,x
+        end if
+
+        ; colore freeze guardia
+        lda guard_freeze,x
+        if not zero then
+           lda #$03 ; cyan
+        else
+           lda #$00 ; nero
+        end if
+        sta curr_guard_color
+
+        lda $02                     ; save guard pointer
+        sta guard_lo,x
+        lda $03
+        sta guard_hi,x
+
+        jsr DrawGuard
+
+        lda $03                     ; si sposta su pagina colore
+        clc
+        adc #color_offset
+        sta $03
+        lda curr_guard_color
+        sta ($02),y                 ; scrive colore nero
+        inx
+        lda GuardCharMoveTable,x
+        pha
+
+        ldx current_guard
+        lda guard_dirs,x
+        tax
+        lda ScreenMoveTable,x
+        if negative then
+           dec $03
+        end if
+        clc
+        adc $02
+        sta $02
+        if carry then
+           inc $03
+        end if
+        lda curr_guard_color
+        sta ($02),y
+        lda $03
+        sec
+        sbc #color_offset          ; ritorna a pagina video
+        sta $03
+        pla
+        sta ($02),y
+        ldx current_guard
+        lda guard_freeze,x
+        if zero then
+           dec guard_steps,x
+        else
+           lda $9004
+           and #$01
+           if zero then
+              dec guard_freeze,x
+           end if
+        end if
+
+CloseGuardLoop:
+        ldx current_guard
+        inx
+        cpx n_guards
+        if not zero then
+           jmp GuardLoop
+        end if
+        rts                        ; chiude ciclo guardie
+
+DrawGuard:
+        ldx current_guard
+        lda guard_steps,x
+        asl
+        sta $05
+        lda guard_dirs,x
+        tax
+        lda Mul16Table,x
+        clc
+        adc $05
+        tax
+        lda GuardCharMoveTable,x
+        ldy #$00
+        sta ($02),y
+        rts
+
+DrawGuard2:
+        ldx current_guard
+        lda guard_dirs,x
+        tax
+        ldy ScreenMoveTable,x
+        bpl LA676
+        dec $03
+        lda #$20
+        sta ($02),y
+        inc $03
+        bne LA67A
+LA676:  lda #$20
+        sta ($02),y
+LA67A:  rts
+
+MoveOneGuard:
+        ldx current_guard
+        lda guard_dirs,x
+        tax
+        lda ScreenMoveTable,x
+        if negative then
+           dec $03
+        end if
+        clc
+        adc $02
+        sta $02
+        if carry then
+           inc $03
+        end if
+        rts
+
+;
+; chiamata quando ostacola con altra guardia
+;
+GuardChangeDir:
+        jsr MoveOneGuard
+        ldx current_guard
+        lda guard_dirs,x
+        tax
+        lda GuardChangeDirTable,x
+        ldx current_guard
+        sta guard_dirs,x
+        jmp CloseGuardLoop
+
+;
+; Cambia direzione quando incontra un maze, sceglie direzione casuale
+;
+GuardTurnMaze:
+        ldx current_guard
+        lda guard_dirs,x
+        asl
+        sta $06
+
+        lda 38400                  ; new random
+        lsr
+        lsr
+        lsr
+        lsr
+        eor $A2
+        and #$01
+
+        sta $05                    ; $05 = guard_dirs[current_guard]*2+rnd(1)
+        clc
+        adc $06
+        tax
+        lda GuardRandomTurnTable,x
+        tax
+        lda MoveTable,x
+        tay
+        if negative then
+           dec $03
+           lda ($02),y
+           inc $03
+        else
+           lda ($02),y
+        end if
+        cmp #$5C
+        bne LA6EB
+        inc $05
+        lda $05
+        and #$01
+        clc
+        adc $06
+        tax
+        lda GuardRandomTurnTable,x
+LA6E2:  ldx current_guard
+        sta guard_dirs,x
+        jmp CloseGuardLoop
+LA6EB:  txa
+        jmp LA6E2
+
+;
+; Esegue effetti sonori (di preciso quali non so)
+;
+
+DoSounds:
+        lda irq_flag2                      ; controlla abilitazione routine
+        if not zero then
+           rts
+        end if
+
+        lda irq_flag2_init_val
+        sta irq_flag2
+        lda #$04
+        sta $900E
+        lda gold_slot_0
+        clc
+        adc gold_slot_1
+        adc gold_slot_2
+        adc #$05
+        sta sound_a
+        inc sound_b
+        lda sound_b
+        cmp sound_a
+        if not negative then
+           lda #$00
+           sta sound_b
+        end if
+        lda n_guards
+        asl
+        clc
+        adc n_guards
+        sec
+        sbc sound_a
+        clc
+        asl
+        clc
+        adc #$a0             ; era: $D0
+        sec
+        sbc sound_b
+        sta $900B
+        sta $900C
+        rts
+
+;
+; killed
+;
+
+Killed:
+        lda     #$80                  ; fa rumore killed e ammutolisce le altre voci
+        sta     $900D
+        lda     #$00
+        sta     bar_counter
+        sta     36874
+        sta     36875
+        sta     36876
+
+        ldx     #$0F                  ; mostra la sequenza di caratteri
+        do
+           ldy     #$00
+           lda     KilledCharTable,x
+           sta     ($00),y
+           stx     36878              ; abbassa il volume
+           stx     $02
+           jsr     Wait               ; ciclo ritardo
+           ldx     $02
+           dex
+        loop until negative
+
+        poke 36877, #00               ; spegne rumore
+
+        lda lives
+        if not zero then
+           jmp StartNewLifeLoop
+        end if
+
+        ldx #$19                      ; stampa GAME OVER (25 caratteri compresi ctrl codes)
+        do
+          lda GameOverTable,x
+          jsr CHROUT
+          dex
+        loop until negative
+        jmp StartNewLifeLoop
+
+
+; **********************************************************
+
+; valori iniziali
+
+ProgramData:
+        .byte $00        ; current_guard
+        .byte $00        ; gold_taken
+        .byte $01        ; player_step
+        .byte $00        ; move_code
+        .byte $02        ; lives
+        .byte $00        ; maze_nr
+
+;
+; Codici per spostamento nelle 4 direzioni
+;
+
+FreezeTable:
+        .byte   $4a,$4b,$4b,$4a
+
+MoveTable:
+        .byte   $EA,$FF,$01,$16
+
+CollisionTable:
+        .byte   $5C,$57,$51,$24
+
+Mul16Table:
+        .byte   $00,$10,$20,$30
+
+KeyCodeTable:
+        .byte   $0D,$15,$16,$2d   ; $2d=: $25=.
+
+ScreenMoveTable:
+        .byte   $16,$01,$FF,$EA
+
+GuardCharMoveTable:
+        .byte   $00,$00,$C0,$20,$C2,$C3,$C4,$C5
+        .byte   $C6,$C7,$C8,$C9,$CA,$CB,$CC,$CD
+        .byte   $CE,$CF,$D0,$20,$D2,$D3,$D4,$D5
+        .byte   $D6,$D7,$D8,$D9,$DA,$DB,$DC,$DD
+        .byte   $DE,$DF,$E0,$20,$E2,$E3,$E4,$E5
+        .byte   $E6,$E7,$E8,$E9,$EA,$EB,$EC,$ED
+        .byte   $EE,$EF,$F0,$20,$F2,$F3,$F4,$F5
+        .byte   $F6,$F7,$F8,$F9,$FA,$FB,$FC,$FD
+        .byte   $FE,$FF
+
+;
+; tabella di jump quando trova oro o tana
+;
+
+FoundGoldJumpTable:
+        .byte   FoundMaze/256,    FoundMaze%256
+        .byte   FoundLingot/256,  FoundLingot%256
+        .byte   FoundLingot/256,  FoundLingot%256
+        .byte   FoundNest/256,    FoundNest%256
+
+
+GuardRandomTurnTable:
+       .byte   $01,$02
+       .byte   $00,$03
+       .byte   $00,$03
+       .byte   $01,$02
+
+GuardChangeDirTable:
+       .byte   $03,$02,$01,$00
+
+CharManMoveTable:
+        .byte   $00,$00
+CharManMoveTable2:
+        .byte   $80,$20,$82,$20,$84,$85,$86,$87,$88,$89,$8A,$8B,$8C,$8D,$8E,$8F
+        .byte   $90,$20,$92,$20,$94,$95,$96,$97,$98,$99,$9A,$9B,$9C,$9D,$9E,$9F
+        .byte   $A0,$20,$A2,$20,$A4,$A5,$A6,$A7,$A8,$A9,$AA,$AB,$AC,$AD,$AE,$AF
+        .byte   $B0,$20,$BF,$20,$BD,$BC,$BB,$BA,$B9,$B8,$B7,$B6,$B5,$B4,$B3,$B2
+
+;
+; sequenza (al contrario) dell'omino che muore
+;
+KilledCharTable:
+        .byte   $5B,$5A,$59,$58,$B0,$A0,$90,$80
+        .byte   $B0,$A0,$90,$80,$B0,$A0,$90,$80
+
+;
+; Scritta game over (con codici di controllo)
+;
+
+GameOverTable:
+        .byte   $52,$45,$56,$4F,$20,$45,$4D,$41
+        .byte   $47,$1D,$1D,$1D,$1D,$1D,$1D,$11
+        .byte   $11,$11,$11,$11,$11,$11,$11,$11
+        .byte   $11,$13,$00,$FA,$80,$FA,$C0,$FA
+        .byte   $E0,$FA,$F0,$FA,$FA,$FA
+
+
+DrawGoldSlots:
+        lda $02                  ; salva il puntatore a ($02)
+        pha
+        lda $03
+        pha
+
+        lda #$CC                 ; carica la posizione video del gold slot
+        sta $02                  ; ($02) punta alla pagina caratteri
+        sta $04                  ; ($04) punta alla pagina colori
+        lda #screen_page
+        sta $03
+        lda #color_page
+        sta $05
+
+        poke gold_slot, #$00     ; contatore di riga (0-2) per lo slot da disegnare
+
+        do
+           ldx gold_slot         ; cicla sui 3 slot
+           lda gold_slot_0,x
+           jsr print_gold
+           inc gold_slot
+           lda gold_slot
+        loop while a<>#$03
+
+        pla
+        sta $03
+        pla
+        sta $02
+        rts
+
+print_gold:
+        tax
+        lda print_gold_table,x
+        ldy #$0
+        sta ($02),y
+        lda #7
+        sta ($04),y
+
+        ; inc video and color ptr by 44 (two rows)
+        clc
+        lda $02
+        adc #44
+        sta $02
+        sta $04
+        lda $03
+        adc #0
+        sta $03
+        clc
+        adc #color_offset
+        sta $05
+        rts
+
+print_gold_table:  byte $20, $57, $51
+
+;
+; Disegna la barra di scorrimento del tempo
+;
+
+ManageProgressBar:
+        lda irq_flag3
+        if not zero then
+ManageProgressBarExit:
+           rts
+        end if
+
+        lda new_bar_speed          ; set the bar speed
+        sta irq_flag3              ;
+
+        lda bar_counter                          ; if reached zero, do nothing
+        if zero then goto ManageProgressBarExit
+
+        dec bar_counter                          ; decrements bar
+
+        if not zero then goto DrawProgressBar    ; if not reached zero, do normal print
+
+        ; has reached zero
+
+        lda #$01                   ; massima velocità alle guardie
+        sta guard_speed
+
+DrawFullBar:
+        ldy #$14
+        do
+           lda #$5C                         ; write maze character
+           sta [screen_start+bar_offset],y  ;
+
+           lda maze_nr                      ;
+           and #$07                         ;
+           tax                              ;
+           lda maze_colors,x                ; calc maze color
+
+           sta [color_start+bar_offset],y   ; writes color
+           dey
+        loop while not zero
+
+        rts
+
+DrawProgressBar:
+        lda bar_counter
+        lsr
+        lsr
+        lsr
+        tax
+        tay
+
+        ; writes the main part of the bar
+        if not zero then
+           do
+             lda #$5C
+             sta [screen_start+bar_offset],x
+             lda #$00
+             sta [color_start+bar_offset],x
+             dex
+           loop while not zero
+        end if
+
+        ; writes the leading character
+        lda bar_counter
+        and #$07
+        clc
+        adc #$40                             ; bar characters: $40...$47
+        sta [screen_start+bar_offset+1],y
+        lda #$00
+        sta [color_start+bar_offset+1],y
+        rts
+
+;
+;
+;
+
+screen_load:
+        lda maze_nr
+        and #$07
+        tax
+        lda maze_colors,x
+        tab
+
+        ora #(8+1*16)                   ; screen border color
+        sta 36879                       ;
+
+        lda masktable,x
+        sta mask
+        eor #$ff
+        sta maskneg
+
+        ldy #0
+        do
+           lda maze0data,y
+           and mask
+           if not zero then
+              lda #$5C
+           else
+              lda #32
+           end if
+           sta screen_start,y
+           tba
+           sta color_start,y
+
+           lda [maze0data+256],y
+           and mask
+           if not zero then
+              lda #$5C
+           else
+              lda #32
+           end if
+           sta [screen_start+256],y
+           tba
+           sta [color_start+256],y
+
+           iny
+        loop while not zero
+
+        lda #$24                    ; scrive simbolo del dollaro
+        sta [screen_start+19]
+        lda #0
+        sta [color_start+19]
+
+        rts
+
+my_print:
+     jsr PRNSTR
+     jsr GOHOME
+     rts
+
+mask      .byte $0
+maskneg   .byte $0
+masktable .byte 1,2,4,8,16,32,64,128
+
+maze_colors:
+          byte $03,04,05,06,07,03,04,05
+
+title_1:  byte $1c,"RETURN TO FORT KNOX",0
+title_2:  byte "LAST SCORE HI SCORE",0
+title_2a: byte "$00000  $00000",0
+title_3:  byte "MOVING: PL:; AND ",$5f,0
+title_4:  byte "OR USE JOYSTICK",0
+title_5:  byte $1f,"F1 START",0
+title_6:  byte "F3 LEVEL: ",0
+
+title_level_1:  byte "EASY   ",0   ; 3
+title_level_2:  byte "NORMAL ",0   ; 6
+title_level_3:  byte "HARD   ",0   ; 10
+title_level_4:  byte "HELL!  ",0   ; 15
+
+level_table:    byte 3,5,8,10
+
+going_to_maze: byte "TO MAZE ",0
+
+IntroScreenData:
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$76,$49,$20,$76,$55,$20,$50,$4f,$20,$76,$67,$91,$76,$49,$20,$76,$4d,$65,$20,$20
+	byte $20,$20,$76,$4d,$20,$76,$64,$20,$67,$65,$20,$76,$7a,$20,$76,$4d,$20,$76,$20,$65,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$50,$4f,$20,$76,$50,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$67,$65,$20,$76,$7a,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$76,$63,$20,$76,$50,$20,$76,$49,$20,$50,$4f,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$76,$63,$20,$76,$7a,$20,$76,$4d,$20,$67,$65,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$76,$4e,$20,$76,$4d,$65,$76,$50,$20,$4d,$4e,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$76,$4d,$20,$76,$20,$65,$76,$7a,$20,$4e,$4d,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+  byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$28,$03,$29,$20,$03,$0f,$0d,$0d,$0f,$04,$0f,$12,$05,$20,$31,$39,$38,$32,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$12,$05,$0d,$09,$18,$05,$04,$20,$02,$19,$20,$0e,$09,$10,$10,$15,$12,$37,$32,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$09,$0e,$20,$32,$30,$30,$37,$20,$20,$20,$20,$20,$20,$20,$20
+	byte $20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20,$20
+
+maze0data:
+        include "maze0.lm"
+
+Raid_On_Fort_Knox_Rom_End:           ; @@@
+
+end
+
